@@ -1,27 +1,41 @@
 const jwt = require('jsonwebtoken');
+const Profilo = require('../models/Profilo');
 
-// Verifica il JWT nell'header Authorization: Bearer <token> e attacca
-// req.user = { id, ruolo, email }. Sostituisce sb.auth.getSession() lato client.
-// Accetta il token anche come query string (?token=...) per i link di
-// download diretti (<a href>, window.open) che non possono impostare header.
-function requireAuth(req, res, next) {
+// NB: autenticazione disattivata temporaneamente su richiesta esplicita, in
+// vista della migrazione di questa app in un'altra dove verrà reimplementata.
+// Un token valido viene comunque accettato se presente; in sua assenza (o se
+// non valido) la richiesta viene autenticata automaticamente come il primo
+// account admin trovato, senza richiedere login.
+let _adminFallback = null;
+
+async function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query.token || null);
-  if (!token) return res.status(401).json({ error: 'Token mancante' });
+  if (token) {
+    try {
+      req.user = jwt.verify(token, process.env.JWT_SECRET);
+      return next();
+    } catch (e) {
+      // token assente/non valido: si prosegue comunque, vedi sotto
+    }
+  }
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = payload;
+    if (!_adminFallback) {
+      const admin = await Profilo.findOne({ ruolo: 'admin' }).select('_id ruolo email nome');
+      _adminFallback = admin
+        ? { id: admin._id.toString(), ruolo: admin.ruolo, email: admin.email, nome: admin.nome }
+        : { id: null, ruolo: 'admin', email: '', nome: 'Admin' };
+    }
+    req.user = _adminFallback;
     next();
   } catch (e) {
-    return res.status(401).json({ error: 'Token non valido o scaduto' });
+    req.user = { id: null, ruolo: 'admin', email: '', nome: 'Admin' };
+    next();
   }
 }
 
-// Da usare dopo requireAuth: blocca l'accesso se il ruolo non è admin.
+// Autenticazione disattivata: l'accesso admin è sempre consentito.
 function requireAdmin(req, res, next) {
-  if (!req.user || req.user.ruolo !== 'admin') {
-    return res.status(403).json({ error: 'Accesso riservato agli amministratori' });
-  }
   next();
 }
 
