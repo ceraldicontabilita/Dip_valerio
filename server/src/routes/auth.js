@@ -39,6 +39,7 @@ router.post('/login', async (req, res) => {
 router.get('/me', requireAuth, async (req, res) => {
   const profilo = await Profilo.findById(req.user.id);
   if (!profilo) return res.status(404).json({ error: 'Profilo non trovato' });
+  if (profilo.eliminato) return res.status(403).json({ error: 'Account disattivato' });
   res.json(profiloPubblico(profilo));
 });
 

@@ -1865,19 +1865,78 @@ Dopo ogni ispezione, riferisci al responsabile tutto ciò che è stato detto o c
 <script>
 'use strict';
 
-const BUILD_VERSION = '2_1_1';
+const BUILD_VERSION = '3_0_0';
 
-// Librerie incorporate inline
-const SB_URL = 'https://qaqqptpprmfjlolordaq.supabase.co';
-const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFhcXFwdHBwcm1mamxvbG9yZGFxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU4NDQ3MDgsImV4cCI6MjA5MTQyMDcwOH0.kTnxsNY3tua_ya4LCB8-vkVdQ1QBPGtLL7Gfg121d1o';
 const QR_TTL = 180;
-const TG_TOKEN     = '8356741692:AAEQfZ1UwxPngevy2mdZpDgFTnF8Kj6huBg'; // Bot admin (tue notifiche)
-const TG_CHAT      = '5441779658';                                          // Tuo chat_id
-const TG_TOKEN_DIP = '8860975812:AAGp-fHYQfeGNpAFQQUa-NpL7aw8S2BwlbI'; // Bot dipendenti @CeraldiPresenze_bot
-const APP_URL      = 'https://valerioceraldi-hub.github.io/Ceraldi/ceraldi_presenze.html';
+const APP_URL = 'https://valerioceraldi-hub.github.io/Ceraldi/ceraldi_presenze.html';
 
-const { createClient } = supabase;
-const sb = createClient(SB_URL, SB_KEY);
+// URL del backend Node/MongoDB che sostituisce Supabase — imposta qui
+// l'indirizzo del servizio Render (es. https://ceraldi-presenze-api.onrender.com).
+// I token dei bot Telegram NON sono più qui: vivono solo lato server.
+const API_BASE_URL = 'https://IMPOSTA-QUI-URL-BACKEND.onrender.com/api';
+
+// Nome utente pubblico del bot Telegram dipendenti (senza @), usato solo per
+// costruire il deep-link tg://resolve — non è un segreto.
+const TG_BOT_DIPENDENTI_USERNAME = 'CeraldiPresenze_bot';
+
+/* ══════════════════ CLIENT API (sostituisce il client Supabase) ══════════════════
+   Un'unica funzione fetch centralizzata: aggiunge il token JWT, serializza il
+   body, e normalizza gli errori in eccezioni con .message leggibile — così il
+   resto dell'app (in particolare DB.safe) continua a funzionare come prima. */
+const Auth = {
+  TOKEN_KEY: 'ceraldi_token',
+  getToken() { return localStorage.getItem(this.TOKEN_KEY); },
+  setToken(t) { if (t) localStorage.setItem(this.TOKEN_KEY, t); else localStorage.removeItem(this.TOKEN_KEY); },
+};
+
+// MongoDB usa `_id` dove Supabase/Postgres usava `id` — invece di correggere
+// ogni singolo call site sparso nell'app (che confronta/legge .id ovunque),
+// aggiungiamo un alias .id = String(_id) su ogni oggetto ricevuto dal backend.
+function normalizeIds(value) {
+  if (Array.isArray(value)) { value.forEach(normalizeIds); return value; }
+  if (value && typeof value === 'object') {
+    if (value._id !== undefined && value.id === undefined) value.id = String(value._id);
+    Object.values(value).forEach(normalizeIds);
+  }
+  return value;
+}
+
+async function apiFetch(path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  const token = Auth.getToken();
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  let body = opts.body;
+  if (body && !(body instanceof FormData)) {
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify(body);
+  }
+  const res = await fetch(API_BASE_URL + path, { ...opts, headers, body });
+  const isJson = (res.headers.get('content-type') || '').includes('application/json');
+  const data = isJson ? await res.json().catch(() => null) : null;
+  if (!res.ok) {
+    const err = new Error((data && data.error) || `Errore ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return normalizeIds(data);
+}
+
+const api = {
+  get:    (path)         => apiFetch(path, { method: 'GET' }),
+  post:   (path, body)   => apiFetch(path, { method: 'POST', body }),
+  patch:  (path, body)   => apiFetch(path, { method: 'PATCH', body }),
+  put:    (path, body)   => apiFetch(path, { method: 'PUT', body }),
+  delete: (path, body)   => apiFetch(path, { method: 'DELETE', body }),
+  upload: (path, formData) => apiFetch(path, { method: 'POST', body: formData }),
+};
+
+// Apre/scarica un file protetto (documenti, allegati) passando il token JWT
+// come query string, dato che i tag <a>/window.open non possono impostare
+// l'header Authorization.
+function urlFileConToken(path) {
+  const sep = path.includes('?') ? '&' : '?';
+  return API_BASE_URL + path + sep + 'token=' + encodeURIComponent(Auth.getToken() || '');
+}
 
 
 /* ======================================================================
@@ -2085,14 +2144,10 @@ async function checkInviteToken() {
     const token  = params.get('invite') || (function(){ try { return sessionStorage.getItem('_invite_token'); } catch(e){ return null; } })();
     if (!token) return false;
     try { sessionStorage.removeItem('_invite_token'); } catch(e) {}
-    const { data: inviti, error } = await sb.from('presenze_inviti')
-      .select('id,nome,scadenza,usato').eq('token', token).limit(1);
-    if (error) { console.warn('invite RLS/error:', error.message); alert('Errore verifica link: ' + error.message); return false; }
-    if (!inviti || !inviti.length) { alert('Link non valido o scaduto.'); return false; }
-    const inv = inviti[0];
-    if (inv.usato)                          { alert('Link gia utilizzato.'); return false; }
-    if (new Date(inv.scadenza) < new Date()) { alert('Link scaduto.'); return false; }
-    _regToken = token; _regInvitoId = inv.id; _regNomeInvito = inv.nome;
+    let inv;
+    try { inv = await api.get('/auth/inviti/' + token); }
+    catch(e) { alert(e.message || 'Link non valido o scaduto.'); return false; }
+    _regToken = token; _regNomeInvito = inv.nome;
     $('pg-login').style.display = 'none';
     $('pg-registrazione').style.display = 'flex';
     $('reg-step-label').textContent = 'Passo 1 di 5';
@@ -2102,7 +2157,10 @@ async function checkInviteToken() {
   } catch(e) { console.error('checkInviteToken:', e); alert('Errore imprevisto: ' + e.message); return false; }
 }
 
-// ── STEP R1: Credenziali ──
+// ── STEP R1: Credenziali ── (solo validazione — l'account viene creato alla
+// fine dello step 2, quando abbiamo anche l'anagrafica completa da inviare
+// in un'unica chiamata a /auth/registrazione)
+let _regEmail = '', _regPassword = '';
 async function regStepCredenziali() {
   const email = $('reg-email').value.trim();
   const pwd   = $('reg-pwd').value;
@@ -2112,41 +2170,13 @@ async function regStepCredenziali() {
   if (pwd.length < 8)  { showMsg('reg-msg-1','Password minimo 8 caratteri','err'); return; }
   if (pwd !== pwd2)    { showMsg('reg-msg-1','Le password non coincidono','err'); return; }
 
-  const btn = document.querySelector('#reg-step-1 .btn-primary');
-  btn.disabled = true; btn.textContent = 'Creazione account...';
-
-  // Crea account Supabase Auth
-  const { data: signUpData, error } = await sb.auth.signUp({
-    email, password: pwd,
-    options: { data: { profilo_id: _regProfiloId } }
-  });
-
-  if (error) {
-    showMsg('reg-msg-1', error.message, 'err');
-    btn.disabled = false; btn.textContent = 'Continua →';
-    return;
-  }
-
-  // Aggiorna profilo con email e auth_id
-  const uid = signUpData?.user?.id;
-  if (uid) {
-    await sb.from('presenze_profili').update({
-      email,
-      id: uid,  // aggiorna l'id al vero auth uuid
-    }).eq('id', _regProfiloId);
-    _regProfiloId = uid;
-  } else {
-    await sb.from('presenze_profili').update({ email }).eq('id', _regProfiloId);
-  }
-
-  // Passa a step 2
+  _regEmail = email; _regPassword = pwd;
   $('reg-step-1').style.display = 'none';
   $('reg-step-2').style.display = 'block';
   $('reg-step-label').textContent = 'Passo 2 di 5 — I tuoi dati';
-  btn.disabled = false; btn.textContent = 'Continua →';
 }
 
-// ── STEP R2: Anagrafica ──
+// ── STEP R2: Anagrafica — crea l'account con tutti i dati raccolti finora ──
 async function regStepAnagrafica() {
   const nome      = $('reg-nome').value.trim();
   const cognome   = $('reg-cognome').value.trim();
@@ -2168,17 +2198,16 @@ async function regStepAnagrafica() {
   const btn = document.querySelector('#reg-step-2 .btn-primary');
   btn.disabled = true; btn.textContent = 'Salvataggio...';
 
-  const { error } = await sb.from('presenze_profili').update({
-    nome, cognome,
-    data_nascita:   nascita,
-    codice_fiscale: cf,
-    telefono:       tel,
-    indirizzo,
-    iban: iban || null,
-  }).eq('id', _regProfiloId);
-
-  if (error) {
-    showMsg('reg-msg-2', error.message, 'err');
+  try {
+    const risultato = await api.post('/auth/registrazione', {
+      token: _regToken, email: _regEmail, password: _regPassword,
+      nome, cognome, data_nascita: nascita, codice_fiscale: cf,
+      telefono: tel, indirizzo, iban: iban || undefined,
+    });
+    Auth.setToken(risultato.token);
+    _regProfiloId = risultato.profilo.id;
+  } catch(e) {
+    showMsg('reg-msg-2', e.message, 'err');
     btn.disabled = false; btn.textContent = 'Continua →';
     return;
   }
@@ -2241,82 +2270,21 @@ function mostraDocRegolamento() {
 }
 function chiudiDoc(id) { const v = $(id); if (v) v.style.display = 'none'; }
 
-// Genera e archivia il documento formale di consenso privacy + regolamento + contratto (firma elettronica)
-async function generaConsensoPrivacy(profiloId, datiProfilo, contrattoVersione) {
-  try {
-    const p = datiProfilo || {};
-    const ts = new Date();
-    const dataLbl = ts.toLocaleDateString('it-IT',{day:'2-digit',month:'long',year:'numeric'});
-    const oraLbl  = ts.toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'});
-    const nomeCompleto = (p.nome||'') + (p.cognome ? ' '+p.cognome : '');
-    const html = '<!DOCTYPE html><html lang="it"><head><meta charset="UTF-8">'
-      + '<style>body{font-family:Arial,sans-serif;font-size:11pt;color:#111;margin:40px;line-height:1.5}'
-      + 'h1{font-size:16pt;color:#1E3A8A;border-bottom:2px solid #1E3A8A;padding-bottom:8px}'
-      + 'h2{font-size:12pt;color:#1E3A8A;margin-top:18px}'
-      + 'p,li{font-size:10pt;line-height:1.6;margin:4px 0}ul{padding-left:18px}'
-      + '.box{background:#eef2ff;border:1px solid #1E3A8A;border-radius:6px;padding:14px;margin:18px 0}'
-      + '.firma{border-top:2px solid #111;margin-top:36px;padding-top:12px}'
-      + '.ref{font-size:9pt;color:#555;font-style:italic}</style></head><body>'
-      + '<h1>Dichiarazione di Consenso Privacy, Regolamento e Contratto</h1>'
-      + '<p><b>Titolare del Trattamento:</b> Ceraldi Group S.r.l. &mdash; P.IVA 04523831214<br>'
-      + 'Sede operativa: Piazza Carit&agrave; 14, 80134 Napoli (NA)<br>'
-      + 'Email: ceraldigroupsrl@gmail.com</p>'
-      + '<h2>Il/La sottoscritto/a dichiara di:</h2><ul>'
-      + '<li>&#x2713; Aver letto e accettato l&rsquo;Informativa Privacy completa (art. 13 GDPR, Reg. UE 2016/679), versione 1.1</li>'
-      + '<li>&#x2713; Acconsentire al trattamento dei dati particolari relativi alla salute (art. 9 par. 2 lett. b GDPR) per la gestione delle assenze per malattia</li>'
-      + '<li>&#x2713; Acconsentire alla ricezione di comunicazioni operative tramite sistemi di notifica digitale (art. 6 par. 1 lett. b GDPR)</li>'
-      + '<li>&#x2713; Prendere atto che l&rsquo;applicazione e i dati aziendali sono di propriet&agrave; di Ceraldi Group S.r.l. e che l&rsquo;account pu&ograve; essere disattivato in qualsiasi momento (art. 4 L. 300/1970)</li>'
-      + '<li>&#x2713; Aver letto e accettato il Regolamento Interno Caffetteria Ceraldi (Versione 2025) (CCNL Pubblici Esercizi/Turismo-FIPE)</li>'
-      + '<li>&#x2713; Aver letto e accettato il Contratto di Lavoro' + (contrattoVersione ? ' (versione '+contrattoVersione+')' : '') + '</li>'
-      + '</ul>'
-      + '<div class="box"><b>Dati del dichiarante:</b><br>'
-      + 'Nome e cognome: ' + nomeCompleto + '<br>'
-      + 'Email: ' + (p.email||'') + '<br>'
-      + 'Codice fiscale: ' + (p.codice_fiscale||'') + '<br>'
-      + 'Data e ora accettazione: ' + dataLbl + ' alle ' + oraLbl + '<br>'
-      + 'Versione documenti: Privacy 1.1 / Regolamento Interno Versione 2025' + (contrattoVersione ? ' / Contratto v'+contrattoVersione : '') + '</div>'
-      + '<p class="ref">Il presente consenso &egrave; stato prestato tramite l&rsquo;applicazione Ceraldi Presenze (valerioceraldi-hub.github.io) con accesso autenticato tramite credenziali personali. La firma elettronica &egrave; vincolante ai sensi del D.Lgs. 82/2005 (CAD) e del Regolamento eIDAS (UE) n. 910/2014.</p>'
-      + '<div class="firma"><p><b>Firma elettronica:</b> ' + nomeCompleto + '</p>'
-      + '<p><b>Data:</b> ' + dataLbl + ' &mdash; ' + oraLbl + '</p>'
-      + '<p><b>Modalit&agrave;:</b> Accettazione digitale tramite app Ceraldi Presenze</p></div>'
-      + '</body></html>';
-    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-    const nomeFile = 'consenso_privacy_'+ts.getFullYear()+'_'+String(ts.getMonth()+1).padStart(2,'0')+'_'+String(ts.getDate()).padStart(2,'0')+'.html';
-    const path = profiloId+'/consensi/'+nomeFile;
-    const { error: upErr } = await sb.storage.from('presenze-allegati').upload(path, blob, { contentType:'text/html', upsert:true });
-    if (upErr) { console.warn('consenso upload:', upErr.message); return; }
-    await sb.from('presenze_documenti').upsert({
-      dipendente_id: profiloId,
-      categoria:     'altro',
-      nome_file:     nomeFile,
-      descrizione:   'Consenso privacy, regolamento e contratto accettato il '+dataLbl+' alle '+oraLbl,
-      url:           path,
-      anno:          ts.getFullYear(),
-      mese:          null,
-      caricato_da:   profiloId
-    }, { onConflict: 'url' });
-  } catch(e) { console.warn('generaConsensoPrivacy:', e.message); }
-}
+// NB: la generazione/archiviazione del PDF di consenso firmato (presente
+// nella versione Supabase) non è stata riportata in questa prima versione
+// del backend Mongo — i dati legalmente rilevanti (privacy_accettata_il,
+// versione, contratto_accettato_il/versione) restano comunque registrati
+// sul profilo tramite /profili/me/accetta-privacy qui sotto.
 
 async function regStepPrivacy() {
   if (!_regChk[1] || !_regChk[2] || !_regChk[3] || !_regChk[4] || !_regChk[5] || !_regChk[6]) {
     showMsg('reg-msg-3','Accetta tutte le voci per continuare','err'); return;
   }
-  const ora = new Date().toISOString();
   const tpl = await DB.safe(() => DB.contrattoTemplate.get(), null);
-  await sb.from('presenze_profili').update({
-    privacy_accettata:      true,
-    privacy_accettata_il:   ora,
-    privacy_versione:       '1.1',
-    contratto_accettato_il: ora,
-    contratto_versione:     tpl ? tpl.versione : null,
-    primo_accesso:          false,
-  }).eq('id', _regProfiloId);
-
-  // Genera documento di consenso firmato e archivialo
-  const { data: profReg } = await sb.from('presenze_profili')
-    .select('nome,cognome,email,codice_fiscale').eq('id', _regProfiloId).single();
-  await generaConsensoPrivacy(_regProfiloId, profReg, tpl ? tpl.versione : null);
+  await api.post('/profili/me/accetta-privacy', {
+    privacy_versione: '1.1',
+    contratto_versione: tpl ? tpl.versione : undefined,
+  });
 
   $('reg-step-3').style.display = 'none';
   $('reg-step-4').style.display = 'block';
@@ -2332,26 +2300,22 @@ function apriTelegramBot() {
   // Apre Telegram via deep link nativo tg:// (nessuna nuova scheda)
   const iframe = document.createElement('iframe');
   iframe.style.display = 'none';
-  iframe.src = 'tg://resolve?domain=CeraldiPresenze_bot&start=' + _regTgCodice;
+  iframe.src = 'tg://resolve?domain=' + TG_BOT_DIPENDENTI_USERNAME + '&start=' + _regTgCodice;
   document.body.appendChild(iframe);
   setTimeout(() => { try { document.body.removeChild(iframe); } catch(e) {} }, 2000);
 }
 
 async function regAvviaTG() {
-  const codice = String(Math.floor(100000 + Math.random() * 900000));
+  const { codice } = await api.post('/profili/me/telegram/avvia');
   _regTgCodice = codice;
-  await sb.from('presenze_profili').update({ tg_link_code: codice }).eq('id', _regProfiloId);
-  // Mostra subito il codice fallback
-  // Codice fallback rimosso — solo deep link
   $('reg-tg-attesa').style.display = 'block';
   if (_regTgPoll) clearInterval(_regTgPoll);
   let tentativi = 0;
   _regTgPoll = setInterval(async () => {
     tentativi++;
     if (tentativi > 300) { clearInterval(_regTgPoll); return; }
-    const { data } = await sb.from('presenze_profili')
-      .select('telegram_chat_id').eq('id', _regProfiloId).single();
-    if (data && data.telegram_chat_id) {
+    const { collegato } = await api.get('/profili/me/telegram/stato');
+    if (collegato) {
       clearInterval(_regTgPoll);
       $('reg-tg-attesa').style.display = 'none';
       $('reg-tg-ok').style.display = 'block';
@@ -2359,11 +2323,11 @@ async function regAvviaTG() {
         $('reg-step-4').style.display = 'none';
         $('reg-step-5').style.display = 'block';
         $('reg-step-label').textContent = 'Passo 5 di 5';
-        const { data: pf } = await sb.from('presenze_profili')
-          .select('telefono,telegram_chat_id').eq('id', _regProfiloId).single();
+        const pf = await api.get('/profili/' + _regProfiloId);
         if (pf && pf.telefono) {
           $('reg-cert-tel').textContent = pf.telefono;
-          await regInviaOTP(pf.telefono, pf.telegram_chat_id);
+          await api.post('/profili/me/certifica', { tipo: 'tel' });
+          showMsg('reg-msg-5','✓ Codice inviato su Telegram','ok');
         }
       }, 1500);
     }
@@ -2371,88 +2335,26 @@ async function regAvviaTG() {
 }
 
 // ── STEP R5: Certifica numero ──
-async function regInviaOTP(telefono, tgChatId) {
-  const otp     = String(Math.floor(100000 + Math.random() * 900000));
-  const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-  const nullId  = '00000000-0000-0000-0000-000000000000';
-
-  await sb.from('presenze_otp').insert({
-    presenza_id:   nullId,
-    dipendente_id: _regProfiloId,
-    codice:        otp,
-    expires_at:    expires,
-    tipo:          'cert_tel'
-  });
-
-  // Invia OTP via bot
-  try {
-    await fetch('https://api.telegram.org/bot' + TG_TOKEN_DIP + '/sendMessage', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id:    tgChatId,
-        text:       '<b>Ceraldi Presenze - Verifica numero</b>\n\nStai certificando: <b>' + telefono + '</b>\n\nCodice OTP:\n<b>' + otp.split('').join('  ') + '</b>\n\n<i>Valido 15 minuti.</i>',
-        parse_mode: 'HTML'
-      })
-    });
-  } catch(e) {}
-
-  showMsg('reg-msg-5','✓ Codice inviato su Telegram','ok');
-}
-
 async function regReinviaOTP() {
-  const { data: pf } = await sb.from('presenze_profili')
-    .select('telefono,telegram_chat_id').eq('id', _regProfiloId).single();
-  if (pf) await regInviaOTP(pf.telefono, pf.telegram_chat_id);
+  hideMsg('reg-msg-5');
+  await DB.safe(() => api.post('/profili/me/certifica', { tipo: 'tel' }), 'Impossibile inviare il codice');
+  showMsg('reg-msg-5','✓ Codice inviato su Telegram','ok');
 }
 
 async function regVerificaOTP() {
   const codice = ($('reg-cert-otp').value || '').trim();
   if (codice.length !== 6) { showMsg('reg-msg-5','Inserisci il codice a 6 cifre','err'); return; }
 
-  const { data: otps } = await sb.from('presenze_otp')
-    .select('id,codice')
-    .eq('dipendente_id', _regProfiloId)
-    .eq('tipo', 'cert_tel')
-    .eq('used', false)
-    .gt('expires_at', new Date().toISOString())
-    .order('created_at', { ascending: false })
-    .limit(5);
-
-  if (!otps || !otps.length) { showMsg('reg-msg-5','Codice scaduto — premi Reinvia','err'); return; }
-  const otp = otps.find(o => o.codice === codice);
-  if (!otp) { showMsg('reg-msg-5','Codice errato — riprova','err'); $('reg-cert-otp').value=''; return; }
-
-  const ora = new Date().toISOString();
-  await Promise.all([
-    sb.from('presenze_otp').update({ used: true }).eq('id', otp.id),
-    sb.from('presenze_profili').update({
-      tel_certificato_il: ora,
-      attivo:             true,
-      invite_token:       null,
-      invite_scadenza:    null,
-    }).eq('id', _regProfiloId),
-  ]);
-
-  // Notifica admin con tutti i dati
-  const { data: pf } = await sb.from('presenze_profili')
-    .select('nome,cognome,email,telefono,indirizzo,codice_fiscale').eq('id', _regProfiloId).single();
-  if (pf) {
-    inviaNotificaTelegramAdmin(
-      '<b>Ceraldi Presenze - Nuovo dipendente registrato</b>\n\n'
-      + '<b>' + (pf.nome||'') + ' ' + (pf.cognome||'') + '</b>\n'
-      + 'Email: ' + (pf.email||'') + '\n'
-      + 'Tel: ' + (pf.telefono||'') + '\n'
-      + 'CF: ' + (pf.codice_fiscale||'') + '\n'
-      + 'Indirizzo: ' + (pf.indirizzo||'') + '\n\n'
-      + 'Completa la scheda con mansione, livello e paga.'
-    );
+  try {
+    await api.post('/profili/me/verifica-certificazione', { tipo: 'tel', codice });
+  } catch(e) {
+    showMsg('reg-msg-5', e.message, 'err'); $('reg-cert-otp').value=''; return;
   }
 
-  // Registrazione completata → vai al login
+  // Registrazione completata — entra subito nell'app (la sessione è già attiva)
+  ME = await api.get('/auth/me');
   $('pg-registrazione').style.display = 'none';
-  $('pg-login').style.display = 'flex';
-  showMsg('l-msg','Registrazione completata! Accedi con la tua email e password.','ok');
+  avviaApp(ME);
 }
 
 /* ── STATE ─────────────────────────────────────────── */
@@ -2700,33 +2602,17 @@ function switchPage(id) {
 }
 
 /* ── DB ────────────────────────────────────────────────
-   Layer dati centralizzato: unico punto di accesso a Supabase.
-   - gestione errori uniforme (log in console + eccezione con contesto)
-   - DB.safe(fn, msgErrore) per i punti dove vuoi un toast invece
-     di un crash silenzioso
-   - metodi già mappati sulle 12 tabelle reali dell'app
+   Layer dati centralizzato: unico punto di accesso al backend Node/MongoDB
+   (ex Supabase). Ogni metodo chiama un endpoint REST tramite `api` invece di
+   sb.from(...) — le firme restano quasi identiche a prima apposta, per non
+   dover riscrivere ogni singolo punto di chiamata nell'app.
 
-   Uso:
+   Uso invariato:
      const data = await DB.safe(() => DB.assenze.lista({dipId: ME.id}),
                                  'Impossibile caricare le assenze');
      if (!data) return; // toast già mostrato
-
-   Le funzioni esistenti che usano sb.from(...) direttamente
-   continuano a funzionare: la migrazione ai metodi DB è graduale,
-   una funzione alla volta, senza fretta. ────────────────────── */
+   ────────────────────────────────────────────────────── */
 const DB = (() => {
-
-  async function run(builder, ctx) {
-    const { data, error } = await builder;
-    if (error) {
-      console.error('[DB]', ctx, error);
-      const e = new Error(ctx + ' — ' + (error.message || 'errore sconosciuto'));
-      e.code = error.code;       // preserva il codice Postgres (es. 23505 = vincolo unico violato)
-      e.original = error;
-      throw e;
-    }
-    return data;
-  }
 
   async function safe(fn, msgErrore) {
     try { return await fn(); }
@@ -2738,184 +2624,114 @@ const DB = (() => {
     }
   }
 
-  const T = (tabella) => ({
-    byId:   (id, sel = '*') => run(sb.from(tabella).select(sel).eq('id', id).single(), tabella + '.byId'),
-    insert: (righe)         => run(sb.from(tabella).insert(righe).select(), tabella + '.insert'),
-    update: (id, patch)     => run(sb.from(tabella).update(patch).eq('id', id).select(), tabella + '.update'),
-    remove: (id)            => run(sb.from(tabella).delete().eq('id', id), tabella + '.remove'),
-  });
+  const qs = (params) => {
+    const p = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') p.set(k, v); });
+    const s = p.toString();
+    return s ? '?' + s : '';
+  };
 
   const profili = {
-    ...T('presenze_profili'),
-    attivi: () =>
-      run(sb.from('presenze_profili').select('*')
-            .eq('ruolo', 'dipendente').eq('attivo', true).order('nome'), 'profili.attivi'),
-    tutti: () =>
-      run(sb.from('presenze_profili').select('*').order('nome'), 'profili.tutti'),
-    byEmail: (email) =>
-      run(sb.from('presenze_profili').select('*')
-            .eq('email', email).maybeSingle(), 'profili.byEmail'),
+    byId:   (id) => api.get('/profili/' + id),
+    update: (id, patch) => api.patch('/profili/' + id, patch),
+    attivi: () => api.get('/profili' + qs({ stato: 'attivi' })),
+    tutti:  () => api.get('/profili' + qs({ stato: 'tutti' })),
+    eliminati: () => api.get('/profili' + qs({ stato: 'eliminati' })),
+    colleghi: () => api.get('/profili'), // per un dipendente il backend restituisce già solo i colleghi attivi
+    elimina: (id) => api.post('/profili/' + id + '/elimina'),
+    ripristina: (id) => api.post('/profili/' + id + '/ripristina'),
   };
 
   const presenze = {
-    ...T('presenze'),
-    delGiorno: (dataISO) =>
-      run(sb.from('presenze').select('*, presenze_profili(nome)')
-            .eq('data', dataISO).order('ts_entrata'), 'presenze.delGiorno'),
-    periodo: (dipId, dal, al) => {
-      let q = sb.from('presenze').select('*')
-                .gte('data', dal).lte('data', al).order('data');
-      if (dipId) q = q.eq('dipendente_id', dipId);
-      return run(q, 'presenze.periodo');
-    },
-    diOggiPerDip: (dipId, dataISO) =>
-      run(sb.from('presenze').select('*')
-            .eq('dipendente_id', dipId).eq('data', dataISO)
-            .maybeSingle(), 'presenze.diOggiPerDip'),
+    byId:        (id) => api.get('/presenze/' + id),
+    insert:      (riga) => api.post('/presenze', riga),
+    update:      (id, patch) => api.patch('/presenze/' + id + '/dettaglio', patch),
+    correggi:    (id, patch) => api.patch('/presenze/' + id + '/correggi', patch),
+    remove:      (id, motivo) => api.delete('/presenze/' + id, { motivo }),
+    approva:     (id, approva) => api.post('/presenze/' + id + '/approva', { approva }),
+    generaOtp:   (id) => api.post('/presenze/' + id + '/genera-otp'),
+    verificaOtp: (id, codice) => api.post('/presenze/' + id + '/verifica-otp', { codice }),
+    oggi:        () => api.get('/presenze/oggi'),
+    stats:       (mese) => api.get('/presenze/stats' + qs({ mese })),
+    delGiorno:   (dataISO) => api.get('/presenze' + qs({ dal: dataISO, al: dataISO })),
+    periodo:     (dipId, dal, al) => api.get('/presenze' + qs({ dal, al, dipendente_id: dipId })),
+    diOggiPerDip: () => api.get('/presenze/oggi'),
   };
 
   const assenze = {
-    ...T('presenze_assenze'),
-    lista: (filtri = {}) => {
-      let q = sb.from('presenze_assenze').select('*')
-                .order('creato_il', { ascending: false });
-      if (filtri.dipId)  q = q.eq('dipendente_id', filtri.dipId);
-      if (filtri.stato)  q = q.eq('stato', filtri.stato);
-      if (filtri.limit)  q = q.limit(filtri.limit);
-      return run(q, 'assenze.lista');
-    },
-    pendenti: () =>
-      run(sb.from('presenze_assenze').select('*')
-            .eq('stato', 'in attesa')
-            .order('creato_il', { ascending: false }), 'assenze.pendenti'),
-    periodo: (dal, al, stati) => {
-      let q = sb.from('presenze_assenze').select('dipendente_id,tipo,data_inizio,data_fine,stato')
-                .lte('data_inizio', al).gte('data_fine', dal);
-      if (stati && stati.length) q = q.in('stato', stati);
-      return run(q, 'assenze.periodo');
-    },
-    rispondi: (id, stato, extra = {}) =>
-      run(sb.from('presenze_assenze')
-            .update({ stato, ...extra }).eq('id', id).select(), 'assenze.rispondi'),
+    byId:   (id) => api.get('/assenze/' + id),
+    insert: (riga) => api.post('/assenze', riga),
+    update: (id, patch) => api.patch('/assenze/' + id, patch),
+    remove: (id) => api.delete('/assenze/' + id),
+    lista: (filtri = {}) => api.get('/assenze' + qs({ dipendente_id: filtri.dipId, stato: filtri.stato, limit: filtri.limit })),
+    pendenti: () => api.get('/assenze' + qs({ stato: 'in attesa' })),
+    periodo: (dal, al, stati) => api.get('/assenze/periodo' + qs({ dal, al, stati: stati && stati.length ? stati.join(',') : undefined })),
+    rispondi: (id, stato, extra = {}) => api.patch('/assenze/' + id + '/rispondi', { stato, ...extra }),
+    rispondiDipendente: (id, stato) => api.patch('/assenze/' + id + '/rispondi-dipendente', { stato }),
+    adminInvia: (riga) => api.post('/assenze/admin-invia', riga),
   };
 
   const allegati = {
-    ...T('presenze_assenze_allegati'),
-    diAssenza: (assenzaId) =>
-      run(sb.from('presenze_assenze_allegati').select('*')
-            .eq('assenza_id', assenzaId), 'allegati.diAssenza'),
+    diAssenza: (assenzaId) => api.get('/assenze/' + assenzaId + '/allegati'),
+    upload: (assenzaId, files) => {
+      const fd = new FormData();
+      Array.from(files).forEach((f) => fd.append('files', f));
+      return api.upload('/assenze/' + assenzaId + '/allegati', fd);
+    },
+    urlFile: (assenzaId, allegatoId) => urlFileConToken('/assenze/' + assenzaId + '/allegati/' + allegatoId + '/file'),
   };
 
   const cambiTurno = {
-    ...T('presenze_cambi_turno'),
-    lista: (filtri = {}) => {
-      let q = sb.from('presenze_cambi_turno').select('*')
-                .order('created_at', { ascending: false });
-      if (filtri.dipId) q = q.or(
-        `richiedente_id.eq.${filtri.dipId},collega_id.eq.${filtri.dipId}`);
-      if (filtri.stato) q = q.eq('stato', filtri.stato);
-      if (filtri.limit) q = q.limit(filtri.limit);
-      return run(q, 'cambiTurno.lista');
-    },
-    perCollega: (collegaId, stato, limit) => {
-      let q = sb.from('presenze_cambi_turno').select('*')
-                .eq('collega_id', collegaId)
-                .order('created_at', { ascending: false });
-      if (stato) q = q.eq('stato', stato);
-      if (limit) q = q.limit(limit);
-      return run(q, 'cambiTurno.perCollega');
-    },
-    rispondi: (id, patch) =>
-      run(sb.from('presenze_cambi_turno')
-            .update(patch).eq('id', id).select(), 'cambiTurno.rispondi'),
-  };
-
-  const otp = {
-    ...T('presenze_otp'),
-    crea: (riga) =>
-      run(sb.from('presenze_otp').insert(riga).select().single(), 'otp.crea'),
-    verifica: (codice, tipo) =>
-      run(sb.from('presenze_otp').select('*')
-            .eq('codice', codice).eq('tipo', tipo)
-            .gte('expires_at', new Date().toISOString())
-            .maybeSingle(), 'otp.verifica'),
+    byId:   (id) => api.get('/cambi-turno/' + id),
+    insert: (riga) => api.post('/cambi-turno', riga),
+    remove: (id) => api.delete('/cambi-turno/' + id),
+    lista: (filtri = {}) => api.get('/cambi-turno' + qs({ stato: filtri.stato, limit: filtri.limit })),
+    perCollega: (collegaId, stato, limit) =>
+      api.get('/cambi-turno' + qs({ stato, limit }))
+        .then((lista) => lista.filter((c) => c.collega_id === collegaId)),
+    rispondiCollega: (id, esito) => api.patch('/cambi-turno/' + id + '/collega', { esito }),
+    rispondiAdmin: (id, esito) => api.patch('/cambi-turno/' + id + '/admin', { esito }),
   };
 
   const documenti = {
-    ...T('presenze_documenti'),
-    lista: (filtri = {}) => {
-      let q = sb.from('presenze_documenti').select('*')
-                .order('anno', { ascending: false })
-                .order('mese', { ascending: false });
-      if (filtri.dipId)     q = q.eq('dipendente_id', filtri.dipId);
-      if (filtri.categoria) q = q.eq('categoria', filtri.categoria);
-      return run(q, 'documenti.lista');
-    },
+    lista: (filtri = {}) => api.get('/documenti' + qs({
+      dipendente_id: filtri.dipId, categoria: filtri.categoria, mese: filtri.mese, anno: filtri.anno,
+    })),
+    upload: (formData) => api.upload('/documenti', formData),
+    remove: (id) => api.delete('/documenti/' + id),
+    urlFile: (id) => urlFileConToken('/documenti/' + id + '/file'),
   };
 
   const acconti = {
-    ...T('presenze_acconti'),
-    delMese: (dipId, mese, anno) => {
-      const dal = anno + '-' + String(mese).padStart(2, '0') + '-01';
-      const al  = new Date(anno, mese, 0).toISOString().split('T')[0]; // ultimo giorno del mese
-      return run(sb.from('presenze_acconti').select('*')
-            .eq('dipendente_id', dipId).gte('data', dal).lte('data', al)
-            .order('creato_il'), 'acconti.delMese');
-    },
-    daConfermare: (dipId) =>
-      run(sb.from('presenze_acconti').select('*')
-            .eq('dipendente_id', dipId).eq('letto_dip', false),
-          'acconti.daConfermare'),
+    delMese: (dipId, mese, anno) => api.get('/acconti' + qs({ dipendente_id: dipId, mese, anno })),
+    daConfermare: (dipId) => api.get('/acconti' + qs({ dipendente_id: dipId, daConfermare: 'true' })),
+    insert: (riga) => api.post('/acconti', riga),
+    conferma: (id) => api.patch('/acconti/' + id + '/conferma'),
   };
 
   const liquidazioni = {
-    ...T('presenze_liquidazioni'),
-    delMese: (mese, anno) =>
-      run(sb.from('presenze_liquidazioni').select('*')
-            .eq('mese', mese).eq('anno', anno), 'liquidazioni.delMese'),
-    daConfermare: (dipId) =>
-      run(sb.from('presenze_liquidazioni').select('*')
-            .eq('dipendente_id', dipId).eq('confermata_dip', false),
-          'liquidazioni.daConfermare'),
+    delMese: (mese, anno) => api.get('/liquidazioni' + qs({ mese, anno })),
+    daConfermare: (dipId) => api.get('/liquidazioni' + qs({ dipendente_id: dipId, daConfermare: 'true' })),
+    insert: (riga) => api.post('/liquidazioni', riga),
+    conferma: (id) => api.patch('/liquidazioni/' + id + '/conferma'),
   };
 
   const avvisi = {
-    ...T('presenze_avvisi'),
-    attivi: () =>
-      run(sb.from('presenze_avvisi').select('*')
-            .eq('attivo', true)
-            .order('creato_il', { ascending: false }), 'avvisi.attivi'),
-    tutti: () =>
-      run(sb.from('presenze_avvisi').select('*')
-            .order('creato_il', { ascending: false }), 'avvisi.tutti'),
-  };
-
-  const inviti = {
-    ...T('presenze_inviti'),
-    byToken: (token) =>
-      run(sb.from('presenze_inviti').select('*')
-            .eq('token', token).maybeSingle(), 'inviti.byToken'),
-  };
-
-  const correzioni = {
-    ...T('presenze_correzioni'),
-    logga: (riga) =>
-      run(sb.from('presenze_correzioni').insert(riga), 'correzioni.logga'),
+    attivi: () => api.get('/avvisi' + qs({ attivo: 'true' })),
+    tutti: () => api.get('/avvisi'),
+    insert: (riga) => api.post('/avvisi', riga),
+    update: (id, patch) => api.patch('/avvisi/' + id, patch),
   };
 
   const contrattoTemplate = {
-    get: () =>
-      run(sb.from('presenze_contratto_template').select('*').eq('id', 1).maybeSingle(), 'contrattoTemplate.get'),
-    save: (testo, versione, aggiornatoDa) =>
-      run(sb.from('presenze_contratto_template')
-            .upsert({ id: 1, testo, versione, aggiornato_il: new Date().toISOString(), aggiornato_da: aggiornatoDa })
-            .select(), 'contrattoTemplate.save'),
+    get: () => api.get('/contratto-template'),
+    save: (testo, versione) => api.put('/contratto-template', { testo, versione }),
   };
 
   return {
-    safe, run,
-    profili, presenze, assenze, allegati, cambiTurno, otp,
-    documenti, acconti, liquidazioni, avvisi, inviti, correzioni, contrattoTemplate,
+    safe,
+    profili, presenze, assenze, allegati, cambiTurno,
+    documenti, acconti, liquidazioni, avvisi, contrattoTemplate,
   };
 })();
 
@@ -2926,25 +2742,20 @@ async function doLogin() {
   if (!email || !pwd) { showMsg('l-msg','Inserisci email e password','err'); return; }
   const btn = $('l-btn');
   btn.disabled = true; btn.textContent = 'Accesso in corso…';
-  const { data, error } = await sb.auth.signInWithPassword({ email, password: pwd });
-  if (error) {
-    showMsg('l-msg','Credenziali non valide','err');
+  let risultato;
+  try {
+    risultato = await api.post('/auth/login', { email, password: pwd });
+  } catch(e) {
+    showMsg('l-msg', e.message || 'Credenziali non valide', 'err');
     btn.disabled = false; btn.textContent = 'Accedi'; return;
   }
-  await bootApp(data.user);
+  Auth.setToken(risultato.token);
+  await bootApp(risultato.profilo);
 }
 
-async function bootApp(user) {
+async function bootApp(profiloIniziale) {
   try {
-    const { data: p, error: perr } = await sb.from('presenze_profili').select('*').eq('id', user.id).single();
-    if (perr) { showMsg('l-msg', 'Errore DB: ' + perr.message, 'err'); $('pg-login').style.display='flex'; return; }
-    if (!p)   { showMsg('l-msg', 'Profilo non trovato — contatta admin', 'err'); $('pg-login').style.display='flex'; return; }
-    if (p.eliminato) {
-      showMsg('l-msg', 'Il tuo account è stato disattivato. Contatta l\'amministratore.', 'err');
-      await sb.auth.signOut();
-      $('pg-login').style.display = 'flex';
-      return;
-    }
+    const p = profiloIniziale || await api.get('/auth/me');
     ME = p;
     $('pg-login').style.display = 'none';
 
@@ -2972,7 +2783,8 @@ async function bootApp(user) {
     // Tutti gli step completati → avvia app
     avviaApp(p);
   } catch(e) {
-    showMsg('l-msg', 'Errore avvio: ' + e.message, 'err');
+    Auth.setToken(null);
+    showMsg('l-msg', 'Sessione scaduta — accedi di nuovo', 'err');
     $('pg-login').style.display = 'flex';
   }
 }
@@ -3028,14 +2840,17 @@ async function salvaNuovaPassword() {
   if (nuova !== conferma) { showMsg('cp-msg','Le password non coincidono','err'); return; }
   const btn = document.querySelector('#sh-cambiaPwd .btn-primary');
   btn.disabled = true; btn.textContent = 'Salvataggio...';
-  const { error } = await sb.auth.updateUser({ password: nuova });
-  if (error) {
-    showMsg('cp-msg', error.message, 'err');
+  try {
+    // NB: questo sheet (primo accesso con password temporanea) non risulta
+    // più raggiunto da nessun punto dell'app anche nella versione Supabase
+    // originale — lasciato per compatibilità, ma /auth/cambia-password
+    // richiede comunque la password attuale per confermare l'identità.
+    await api.post('/auth/cambia-password', { attuale: $('cp-attuale') ? $('cp-attuale').value : '', nuova });
+  } catch(e) {
+    showMsg('cp-msg', e.message, 'err');
     btn.disabled = false; btn.textContent = 'Salva e continua →';
     return;
   }
-  // Segna primo_accesso completato
-  await sb.from('presenze_profili').update({ primo_accesso: false }).eq('id', ME.id);
   ME.primo_accesso = false;
   toast('✓ Password aggiornata con successo');
   closeSheet('sh-cambiaPwd');
@@ -3067,15 +2882,9 @@ async function salvaConsensoPrivacy() {
   }
   const btn = $('priv-btn');
   btn.disabled = true; btn.textContent = 'Salvataggio...';
-  const tsNow = new Date().toISOString();
-  // Salva in localStorage subito (funziona sempre, indipendente da RLS)
+  // Salva subito in localStorage (funziona anche se la chiamata di rete fallisse)
   try { localStorage.setItem('priv_' + ME.id, '1.1'); } catch(e) {}
-  // Prova a salvare anche su Supabase
-  await sb.from('presenze_profili').update({
-    privacy_accettata: true, privacy_accettata_il: tsNow, privacy_versione: '1.1'
-  }).eq('id', ME.id);
-  // Genera documento di consenso firmato e archivialo
-  await generaConsensoPrivacy(ME.id, ME);
+  await DB.safe(() => api.post('/profili/me/accetta-privacy', { privacy_versione: '1.1' }), null);
   ME.privacy_accettata = true;
   $('pg-privacy').classList.remove('on');
   // STEP 3: Telegram
@@ -3087,7 +2896,7 @@ async function salvaConsensoPrivacy() {
 
 async function doLogout() {
   stopScanner(); clearInterval(qrTimer);
-  await sb.auth.signOut();
+  Auth.setToken(null);
   ME = null;
   $('app').style.display = 'none';
   $('pg-login').style.display = 'flex';
@@ -3104,31 +2913,26 @@ async function doLogout() {
   } catch(e) {}
 })();
 
-sb.auth.getSession().then(async ({ data }) => {
+(async function avviaSessione() {
   try {
     const params = new URLSearchParams(window.location.search);
     if (params.get('invite')) {
-      // Salva il token prima di signOut (in caso di reload da parte di Supabase)
       try { sessionStorage.setItem('_invite_token', params.get('invite')); } catch(e) {}
-      if (data.session) await sb.auth.signOut({ scope: 'local' });
+      Auth.setToken(null); // un eventuale invito prevale su una sessione già aperta nello stesso browser
       const ok = await checkInviteToken();
-      if (!ok) {
-        var el = document.getElementById('pg-login');
-        if (el) el.style.display = 'flex';
-      }
+      if (!ok) $('pg-login').style.display = 'flex';
       return;
     }
-    if (data.session) {
-      bootApp(data.session.user);
+    if (Auth.getToken()) {
+      await bootApp();
     } else {
       $('pg-login').style.display = 'flex';
     }
   } catch(e) {
-    console.error('getSession error:', e);
-    if (data.session) bootApp(data.session.user);
-    else $('pg-login').style.display = 'flex';
+    console.error('avviaSessione error:', e);
+    $('pg-login').style.display = 'flex';
   }
-});
+})();
 
 // Gestisci deep link #assenze
 window.addEventListener('hashchange', () => {
@@ -3587,7 +3391,7 @@ async function openDettaglioAssenza(id, isAdmin) {
         return `<div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:8px;display:flex;align-items:center;gap:10px">
           <span style="font-size:22px">${isImg?'🖼':'📄'}</span>
           <div style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">${esc(al.nome_file)}</div>
-          <button class="btn-sm primary" onclick="scaricaAllegato('${escAttr(al.url)}','${escAttr(al.nome_file)}')">Apri</button>
+          <button class="btn-sm primary" onclick="scaricaAllegato('${id}','${al.id}')">Apri</button>
         </div>`;
       }).join('');
   }
@@ -3848,12 +3652,8 @@ async function eliminaAssenza() {
   await caricaAssenzeDip();
 }
 
-async function scaricaAllegato(url, nome) {
-  const { data } = await sb.storage.from('presenze-allegati').createSignedUrl(url, 60);
-  if (data) {
-    const a = document.createElement('a');
-    a.href = data.signedUrl; a.target = '_blank'; a.download = nome; a.click();
-  }
+function scaricaAllegato(assenzaId, allegatoId) {
+  window.open(DB.allegati.urlFile(assenzaId, allegatoId), '_blank');
 }
 
 /* ── NUOVA ASSENZA (dipendente) ──────────────────────── */
@@ -3900,13 +3700,7 @@ async function inviaRichiestaAssenza() {
   const btn = $('na-btn');
   btn.disabled = true; btn.textContent = 'Invio in corso…';
 
-  const payload = {
-    dipendente_id:    ME.id,
-    nome_dipendente:  ME.nome + (ME.cognome ? ' '+ME.cognome : ''),
-    tipo,
-    note:             note || null,
-    importo_richiesto: importo || null
-  };
+  const payload = { tipo, note: note || undefined, importo_richiesto: importo || undefined };
   if (tipo === 'malattia') {
     const prot = ($('na-protocollo') ? $('na-protocollo').value.trim() : '');
     if (prot) payload.protocollo_inps = prot;
@@ -3916,42 +3710,17 @@ async function inviaRichiestaAssenza() {
     payload.data_fine   = al;
   }
 
-  const { data: ass, error } = await sb.from('presenze_assenze').insert(payload).select().single();
+  let ass;
+  try {
+    ass = await DB.assenze.insert(payload);
+  } catch(e) {
+    showMsg('na-msg', e.message, 'err'); btn.disabled=false; btn.textContent='Invia richiesta'; return;
+  }
 
-  if (error) { showMsg('na-msg', error.message, 'err'); btn.disabled=false; btn.textContent='Invia richiesta'; return; }
-
-  // upload allegati
   if (files.length) {
-    for (const file of Array.from(files)) {
-      if (file.size > 5*1024*1024) continue; // skip >5MB
-      const path = `${ME.id}/${ass.id}/${Date.now()}_${file.name}`;
-      const { error: upErr } = await sb.storage.from('presenze-allegati').upload(path, file);
-      if (!upErr) {
-        await sb.from('presenze_assenze_allegati').insert({
-          assenza_id: ass.id, nome_file: file.name, url: path
-        });
-      }
-    }
+    const validi = Array.from(files).filter(f => f.size <= 5*1024*1024); // skip >5MB
+    if (validi.length) await DB.safe(() => DB.allegati.upload(ass.id, validi), 'Alcuni allegati non sono stati caricati');
   }
-
-  // Notifica Telegram all'admin
-  const titoloTG = { ferie:'🌴 Ferie', malattia:'🤒 Malattia', acconto:'💶 Acconto', altro:'📋 Altro' };
-  const nomeDip = ME.nome + (ME.cognome ? ' ' + ME.cognome : '');
-  let testoTG = '<b>📋 Ceraldi Presenze — Nuova richiesta</b>\n\n';
-  testoTG += '<b>Dipendente:</b> ' + escTG(nomeDip) + '\n';
-  testoTG += '<b>Tipo:</b> ' + (titoloTG[tipo] || tipo) + '\n';
-  if (isAcconto) {
-    testoTG += '<b>Importo:</b> € ' + (importo ? importo.toFixed(2) : '—') + '\n';
-  } else {
-    testoTG += '<b>Dal:</b> ' + new Date(dal).toLocaleDateString('it-IT',{day:'2-digit',month:'long',year:'numeric'}) + '\n';
-    testoTG += '<b>Al:</b> '  + new Date(al).toLocaleDateString('it-IT',{day:'2-digit',month:'long',year:'numeric'}) + '\n';
-    const gg = Math.round((new Date(al)-new Date(dal))/86400000)+1;
-    testoTG += '<b>Giorni:</b> ' + gg + '\n';
-  }
-  if (note) testoTG += '<b>Note:</b> ' + escTG(note) + '\n';
-  const appUrl = 'https://valerioceraldi-hub.github.io/Ceraldi/ceraldi_presenze.html#assenze';
-  testoTG += '\n\n<a href="' + appUrl + '">📲 Apri Ceraldi Presenze → Assenze</a>';
-  inviaNotificaTelegram(testoTG, '#assenze');
 
   toast('Richiesta inviata');
   btn.disabled=false; btn.textContent='Invia richiesta';
@@ -3968,16 +3737,13 @@ async function openSheetCambioTurno() {
   // Popola elenco colleghi (esclude se stesso)
   const sel = $('ct-collega');
   sel.innerHTML = '<option value="">— seleziona collega —</option>';
-  try {
-    const { data: colleghi } = await sb.from('presenze_profili')
-      .select('id,nome,cognome').eq('ruolo','dipendente').eq('attivo',true).neq('id', ME.id).order('nome');
-    (colleghi||[]).forEach(c => {
-      const opt = document.createElement('option');
-      opt.value = c.id;
-      opt.textContent = (c.nome||'')+(c.cognome?' '+c.cognome:'');
-      sel.appendChild(opt);
-    });
-  } catch(e) { console.warn('colleghi:', e); }
+  const colleghi = await DB.safe(() => DB.profili.colleghi(), 'Impossibile caricare i colleghi');
+  (colleghi||[]).forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c.id;
+    opt.textContent = (c.nome||'')+(c.cognome?' '+c.cognome:'');
+    sel.appendChild(opt);
+  });
   openSheet('sh-cambioTurno');
 }
 
@@ -3993,35 +3759,11 @@ async function inviaRichiestaCambioTurno() {
   const btn = $('ct-btn');
   btn.disabled = true; btn.textContent = 'Invio in corso…';
 
-  const { data: collega } = await sb.from('presenze_profili').select('nome,cognome').eq('id',collegaId).single();
-  const nomeRichiedente = ME.nome + (ME.cognome ? ' '+ME.cognome : '');
-  const nomeCollega = collega ? (collega.nome||'')+(collega.cognome?' '+collega.cognome:'') : '—';
-
-  let insertErr = null;
   try {
-    await DB.cambiTurno.insert({
-      richiedente_id: ME.id, nome_richiedente: nomeRichiedente,
-      collega_id: collegaId, nome_collega: nomeCollega,
-      data_turno: data, fascia_oraria: fascia, note: note || null,
-      stato: 'attesa_collega', collega_stato: 'in attesa'
-    });
-  } catch (e) { insertErr = e; }
-
-  if (insertErr) {
-    const msgErr = insertErr.message.includes('schema cache') || insertErr.message.includes('does not exist')
-      ? 'Tabella non configurata su Supabase — contatta l\'amministratore tecnico'
-      : insertErr.message;
-    showMsg('ct-msg', msgErr, 'err'); btn.disabled=false; btn.textContent='Invia richiesta'; return;
+    await DB.cambiTurno.insert({ collega_id: collegaId, data_turno: data, fascia_oraria: fascia, note: note || undefined });
+  } catch (e) {
+    showMsg('ct-msg', e.message, 'err'); btn.disabled=false; btn.textContent='Invia richiesta'; return;
   }
-
-  // Notifica Telegram al COLLEGA — deve accettare lui prima che l'admin valuti
-  const dataLbl = new Date(data).toLocaleDateString('it-IT',{weekday:'long',day:'2-digit',month:'long'});
-  let msgCollega = '🔄 <b>Richiesta cambio turno</b>\n\n';
-  msgCollega += '<b>'+escTG(nomeRichiedente)+'</b> ti chiede di scambiare il turno del <b>'+dataLbl+'</b>\n';
-  msgCollega += '⏰ Fascia: <b>'+fascia.replace('-',' – ')+'</b>\n';
-  if (note) msgCollega += '\nNote: '+escTG(note)+'\n';
-  msgCollega += '\nApri l\'app per accettare o rifiutare.';
-  await inviaNotificaDipendente(collegaId, msgCollega, '#assenze');
 
   toast('✓ Richiesta inviata al collega — appena accetta verrà sottoposta all\'amministratore');
   btn.disabled=false; btn.textContent='Invia richiesta';
@@ -4047,33 +3789,26 @@ async function caricaCambiTurnoDip() {
   wrap.innerHTML = data.map(c => renderCambioTurnoCard(c, false)).join('');
 }
 
+// Codici OTP generati in questa sessione per le proprie timbrature manuali
+// da confermare — non persistiti lato client: chi ricarica la pagina puo'
+// generare un nuovo codice (validita' 10 minuti, non e' un problema).
+let _otpCodiciDip = {};
+
 async function caricaStoricoDip() {
-  const { data } = await sb.from('presenze')
-    .select('*').eq('dipendente_id', ME.id)
-    .order('ts_entrata',{ascending:false}).limit(14);
+  const data = await DB.safe(() => DB.presenze.periodo(ME.id, '0000-01-01', '9999-12-31'), 'Impossibile caricare lo storico');
   const wrap = $('storico-dip');
-  if (!data || !data.length) {
+  const recenti = (data || []).sort((a,b) => new Date(b.ts_entrata)-new Date(a.ts_entrata)).slice(0,14);
+  if (!recenti.length) {
     wrap.innerHTML = '<div class="empty"><div class="empty-icon">&#x1F550;</div><div class="empty-txt">Nessuna timbratura ancora</div></div>';
     return;
   }
-  // Carica OTP attivi per le presenze manuali non confermate
-  const presManId = data.filter(r => r.tipo_timbratura==='manuale' && r.confermata_dip===false).map(r => r.id);
-  let otpMap = {};
-  if (presManId.length) {
-    const { data: otps } = await sb.from('presenze_otp')
-      .select('presenza_id,codice,expires_at')
-      .in('presenza_id', presManId)
-      .eq('used', false)
-      .gt('expires_at', new Date().toISOString());
-    (otps||[]).forEach(o => { otpMap[o.presenza_id] = o; });
-  }
 
   let html = '';
-  for (const r of data) {
+  for (const r of recenti) {
     const isManuale = r.tipo_timbratura === 'manuale';
     const isManualeDip = r.tipo_timbratura === 'manuale_dip';
     const daCon = (isManuale || isManualeDip) && r.confermata_dip === false;
-    const otp = otpMap[r.id];
+    const otp = _otpCodiciDip[r.id];
 
     let destra;
     if (isManualeDip && daCon) {
@@ -4083,8 +3818,8 @@ async function caricaStoricoDip() {
       if (otp) {
         destra = '<div style="text-align:center">'
           + '<div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.5px;text-transform:uppercase;margin-bottom:2px">Codice OTP</div>'
-          + '<div style="font-size:24px;font-weight:800;letter-spacing:4px;color:var(--accent)">' + otp.codice + '</div>'
-          + '<div style="font-size:10px;color:var(--muted);margin-top:2px">Dettalo all\u2019admin</div>'
+          + '<div style="font-size:24px;font-weight:800;letter-spacing:4px;color:var(--accent)">' + otp + '</div>'
+          + '<div style="font-size:10px;color:var(--muted);margin-top:2px">Dettalo all’admin</div>'
           + '</div>';
       } else {
         destra = '<button class="btn-sm primary" onclick="generaOTP(\'' + r.id + '\')">Genera codice</button>';
@@ -5790,89 +5525,19 @@ async function esportaStipendi() {
   toast('CSV esportato');
 }
 
-/* ── EXPORT CSV ─────────────────────────────────────── */
-/* ── TELEGRAM ───────────────────────────────────────── */
+/* ── TELEGRAM ─────────────────────────────── */
+/* I token dei bot vivono solo lato server: queste funzioni sono ora un sottile wrapper sul relay generico /api/telegram/notifica-* — usato dai punti dell'app che innescano una notifica ad-hoc (promemoria, solleciti); le azioni CRUD ordinarie fanno già inviare la notifica dal backend direttamente. */
 async function inviaNotificaTelegram(testo, deepLink) {
-  try {
-    const link = deepLink ? '\n\n<a href="' + APP_URL + deepLink + '">➡️ Apri nell\'app</a>' : '';
-    const res = await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: TG_CHAT,
-        text: testo + link,
-        parse_mode: 'HTML',
-        disable_web_page_preview: false
-      })
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      console.error('[TG admin] invio rifiutato', res.status, body);
-    }
-  } catch(e) { console.error('[TG admin] errore rete', e); }
+  await DB.safe(() => api.post('/telegram/notifica-admin', { testo, deepLink }), null);
 }
-
-/* ── TELEGRAM DIPENDENTI ─────────────────────────────── */
-
-// Invia notifica al singolo dipendente tramite bot dedicato
-// dipId: uuid del dipendente, testo: messaggio HTML
-// deepLink: hash della pagina (es. '#richieste', '#docs', '')
+async function inviaNotificaTelegramAdmin(testo) {
+  await DB.safe(() => api.post('/telegram/notifica-admin', { testo }), null);
+}
 async function inviaNotificaDipendente(dipId, testo, deepLink) {
-  if (!TG_TOKEN_DIP) return; // Bot non configurato
-  // Recupera il chat_id del dipendente
-  const { data: prof } = await sb.from('presenze_profili')
-    .select('telegram_chat_id,nome,cognome').eq('id', dipId).single();
-  if (!prof || !prof.telegram_chat_id) return; // Non collegato
-  const link = APP_URL + (deepLink || '');
-  const testoCompleto = testo + '\n\n<a href="' + link + '">\u27a1\ufe0f Apri nell\'app</a>';
-
-  try {
-    const res = await fetch('https://api.telegram.org/bot' + TG_TOKEN_DIP + '/sendMessage', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: prof.telegram_chat_id,
-        text:    testoCompleto,
-        parse_mode: 'HTML',
-        disable_web_page_preview: false
-      })
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      console.error('[TG dip] invio rifiutato', res.status, body);
-    }
-  } catch(e) { console.error('[TG dip] errore rete', e); }
+  await DB.safe(() => api.post('/telegram/notifica-dipendente', { dipendente_id: dipId, testo, deepLink }), null);
 }
-
-// Invia a tutti i dipendenti attivi (es. per avvisi bacheca)
 async function inviaNotificaTuttiDipendenti(testo, deepLink) {
-  if (!TG_TOKEN_DIP) return;
-  const { data: profs } = await sb.from('presenze_profili')
-    .select('telegram_chat_id').eq('ruolo','dipendente').eq('attivo',true)
-    .not('telegram_chat_id','is',null);
-  if (!profs || !profs.length) return;
-  const link = APP_URL + (deepLink || '');
-  const testoCompleto = testo + '\n\n<a href="' + link + '">\u27a1\ufe0f Apri nell\'app</a>';
-  for (const p of profs) {
-    if (!p.telegram_chat_id) continue;
-    try {
-      const res = await fetch('https://api.telegram.org/bot' + TG_TOKEN_DIP + '/sendMessage', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: p.telegram_chat_id,
-          text: testoCompleto,
-          parse_mode: 'HTML',
-          disable_web_page_preview: false
-        })
-      });
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        console.error('[TG tutti] invio rifiutato', p.telegram_chat_id, res.status, body);
-      }
-    } catch(e) { console.error('[TG tutti] errore rete', p.telegram_chat_id, e); }
-    await new Promise(r => setTimeout(r, 100)); // evita rate limit
-  }
+  await DB.safe(() => api.post('/telegram/notifica-tutti', { testo, deepLink }), null);
 }
 
 
@@ -6032,16 +5697,6 @@ async function verificaCertificazioneObbligatoria() {
   }, 1800);
 }
 
-/* ── Funzione notifica admin separata ──────────────────────────────── */
-async function inviaNotificaTelegramAdmin(testo) {
-  try {
-    await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT, text: testo, parse_mode: 'HTML', disable_web_page_preview: true })
-    });
-  } catch(e) {}
-}
 
 /* ── COLLEGAMENTO BOT DIPENDENTE ─────────────────────── */
 // Il dipendente invia /start@[nome_bot] — il bot risponde
@@ -6619,18 +6274,9 @@ async function salvaTimbrManuale() {
 }
 // Dipendente: genera OTP per la sua timbratura manuale
 async function generaOTP(presenzaId) {
-  const codice = String(Math.floor(100000 + Math.random() * 900000));
-  const scade  = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 minuti
-  // Invalida OTP precedenti
-  await sb.from('presenze_otp')
-    .update({ used: true })
-    .eq('presenza_id', presenzaId)
-    .eq('dipendente_id', ME.id);
-  let insertErr = null;
-  try {
-    await DB.otp.crea({ presenza_id: presenzaId, dipendente_id: ME.id, codice, expires_at: scade });
-  } catch (e) { insertErr = e; }
-  if (insertErr) { toast('Errore generazione codice'); return; }
+  const risultato = await DB.safe(() => DB.presenze.generaOtp(presenzaId), 'Errore generazione codice');
+  if (!risultato) return;
+  _otpCodiciDip[presenzaId] = risultato.codice;
   toast('Codice generato — valido 10 minuti');
   await caricaStoricoDip();
 }
@@ -6649,27 +6295,13 @@ function openOTPAdmin(presenzaId, nomeDip) {
 async function verificaOTP() {
   const codice = $('otp-input').value.trim();
   if (codice.length !== 6) { showMsg('otp-msg','Inserisci 6 cifre','err'); return; }
-  // Cerca OTP valido
-  const { data: otps } = await sb.from('presenze_otp')
-    .select('id,codice,expires_at')
-    .eq('presenza_id', _otpPresenzaId)
-    .eq('used', false)
-    .gt('expires_at', new Date().toISOString());
-  if (!otps || !otps.length) {
-    showMsg('otp-msg','Nessun codice valido — chiedi al dipendente di generarne uno nuovo','err'); return;
-  }
-  const otp = otps.find(o => o.codice === codice);
-  if (!otp) {
-    showMsg('otp-msg','Codice errato — riprova','err');
+  try {
+    await DB.presenze.verificaOtp(_otpPresenzaId, codice);
+  } catch(e) {
+    showMsg('otp-msg', e.message, 'err');
     $('otp-input').value = '';
     return;
   }
-  // OTP corretto: marca presenza come confermata e OTP come usato
-  const ok = await DB.safe(() => Promise.all([
-    DB.presenze.update(_otpPresenzaId, { confermata_dip: true }),
-    DB.otp.update(otp.id, { used: true })
-  ]), 'Errore durante il salvataggio');
-  if (!ok) return;
   toast('✓ Presenza verificata e confermata');
   closeSheet('sh-otpAdmin');
   await caricaOggi();
